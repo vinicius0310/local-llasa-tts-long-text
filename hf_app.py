@@ -8,6 +8,7 @@ import argparse
 import json
 import numpy as np
 import random
+import re
 
 print("Initializing system...", flush=True)
 
@@ -166,6 +167,23 @@ def initialize_models():
 ###############################################################################
 #                             UTILITY FUNCTIONS                               #
 ###############################################################################
+
+def chunk_text(text, min_length=200):
+    sentences = re.split(r'(?<=\.|\!|\,|\?)\s+', text)
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 >= min_length:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+        else:
+            current_chunk += " " + sentence if current_chunk else sentence
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
 
 def toggle_auto_optimize_checkbox(mode):
     return gr.update(interactive=(mode=="Text only"))
@@ -399,6 +417,71 @@ def set_seed(seed):
         random.seed(seed)
         torch.backends.cudnn.deterministic = True
 
+def infer_long_text(
+    generation_mode,
+    ref_audio_path,
+    target_text,
+    model_version,
+    hf_api_key,
+    trim_audio,
+    max_length,
+    temperature,
+    top_p,
+    whisper_language,
+    user_seed,
+    random_seed_each_gen,
+    beam_search_enabled,
+    auto_optimize_length,
+    prev_history,
+    progress=gr.Progress(),
+    chunk_length=200
+):
+    chunks = chunk_text(target_text, min_length=chunk_length)
+    audio_segments = []
+    
+    for idx, chunk in enumerate(chunks):
+        progress(idx/len(chunks), f"Processing chunk {idx+1}/{len(chunks)}")
+        # Unpack all three return values from infer()
+        (sr, chunk_audio), _, updated_history = infer(
+            generation_mode,
+            ref_audio_path,
+            chunk,
+            model_version,
+            hf_api_key,
+            trim_audio,
+            max_length,
+            temperature,
+            top_p,
+            whisper_language,
+            user_seed,
+            random_seed_each_gen,
+            beam_search_enabled,
+            auto_optimize_length,
+            prev_history,
+            progress
+        )
+        audio_segments.append(chunk_audio)
+        prev_history = updated_history  # Update history with latest
+    
+    final_audio = join_audio_segments(audio_segments, sample_rate=16000)
+    audio_data_url = generate_audio_data_url(final_audio)
+    
+    new_entry = {
+        "mode": f"Long Text ({len(chunks)} chunks)",
+        "text": target_text,
+        "audio_url": audio_data_url,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_length": max_length,
+        "seed": "N/A" if random_seed_each_gen else user_seed,
+    }
+    
+    if len(prev_history) >= MAX_HISTORY:
+        prev_history.pop(0)
+    prev_history.append(new_entry)
+    
+    return (16000, final_audio), render_previous_generations(prev_history), prev_history
+
 def infer(
     generation_mode,         # "Text only" or "Reference audio"
     ref_audio_path,          # Reference audio file path (if any)
@@ -430,7 +513,7 @@ def infer(
     if len(target_text) == 0:
         return None, render_previous_generations(prev_history), prev_history
     elif len(target_text) > 1000:
-        gr.warning("Text is too long. Truncating to 1000 characters.")
+        gr.Warning("Text is too long. Truncating to 1000 characters.")
         target_text = target_text[:1000]
     if auto_optimize_length:
         input_len = tokenizer.apply_chat_template(
@@ -465,7 +548,7 @@ def infer(
             vq_code_prompt = vq_code_prompt[0, 0, :]
             speech_ids_prefix = ids_to_speech_tokens(vq_code_prompt)
     elif generation_mode == "Reference audio" and not ref_audio_path:
-        gr.warning("No reference audio provided. Proceeding in text-only mode.")
+        gr.Warning("No reference audio provided. Proceeding in text-only mode.")
     progress(0.5, "Generating speech...")
     combined_input_text = prompt_text + " " + target_text
     prefix_str = "".join(speech_ids_prefix) if speech_ids_prefix else ""
@@ -596,6 +679,13 @@ def build_dashboard():
                             trim_audio_checkbox_std = gr.Checkbox(label="Trim Reference Audio to 15s?", value=False)
                         gen_text_input = gr.Textbox(label="Text to Generate", lines=4, placeholder="Enter text here...")
                         with gr.Accordion("Advanced Generation Settings", open=False):
+                            chunk_length_slider = gr.Slider(minimum=100, maximum=1000, value=300, step=50, label="Chunk Length (characters)", visible=False)
+                            long_text_checkbox = gr.Checkbox(label="Enable Long Text Processing", value=False)
+                            long_text_checkbox.change(
+                                fn=lambda x: gr.update(visible=x),
+                                inputs=long_text_checkbox,
+                                outputs=chunk_length_slider
+                            )
                             max_length_slider_std = gr.Slider(minimum=64, maximum=4096, value=1024, step=64, label="Max Length (tokens)")
                             temperature_slider_std = gr.Slider(minimum=0.1, maximum=2.0, value=1.0, step=0.1, label="Temperature")
                             top_p_slider_std = gr.Slider(minimum=0.1, maximum=1.0, value=1.0, step=0.05, label="Top-p")
@@ -658,9 +748,10 @@ def build_dashboard():
         
         # --- Callback Functions ---
         def synthesize_standard(generation_mode, ref_audio_input, gen_text_input, model_choice, api_key_input,
-                                max_length_slider, temperature_slider, top_p_slider, whisper_language,
-                                seed_number, random_seed_checkbox, beam_search_checkbox, auto_optimize_checkbox,
-                                trim_audio, prev_history):
+                        max_length_slider, temperature_slider, top_p_slider, whisper_language,
+                        seed_number, random_seed_checkbox, beam_search_checkbox, auto_optimize_checkbox,
+                        trim_audio, prev_history, long_text_enabled, chunk_length):
+            # Common parameters for both modes
             common_params = {
                 "model_version": model_choice,
                 "hf_api_key": api_key_input,
@@ -674,7 +765,26 @@ def build_dashboard():
                 "beam_search_enabled": beam_search_checkbox,
                 "auto_optimize_length": auto_optimize_checkbox,
             }
-            return infer(generation_mode, ref_audio_input, gen_text_input, **common_params, prev_history=prev_history)
+
+            if long_text_enabled:
+                # Long text processing path
+                return infer_long_text(
+                    generation_mode=generation_mode,
+                    ref_audio_path=ref_audio_input,
+                    target_text=gen_text_input,
+                    prev_history=prev_history,
+                    chunk_length=chunk_length,
+                    **common_params
+                )
+            else:
+                # Standard processing path
+                return infer(
+                    generation_mode=generation_mode,
+                    ref_audio_path=ref_audio_input,
+                    target_text=gen_text_input,
+                    prev_history=prev_history,
+                    **common_params
+                )
         
         def synthesize_podcast(podcast_transcript, model_choice, api_key_input,
                                max_length_slider, temperature_slider, top_p_slider, whisper_language,
@@ -708,7 +818,7 @@ def build_dashboard():
             inputs=[generation_mode_std, ref_audio_input, gen_text_input, model_choice_std, api_key_input_std,
                     max_length_slider_std, temperature_slider_std, top_p_slider_std, whisper_language_std,
                     seed_number_std, random_seed_checkbox_std, beam_search_checkbox_std, auto_optimize_checkbox_std,
-                    trim_audio_checkbox_std, prev_history_state],
+                    trim_audio_checkbox_std, prev_history_state, long_text_checkbox, chunk_length_slider],
             outputs=[audio_output_std, dashboard_html_std, prev_history_state]
         )
         
